@@ -80,20 +80,35 @@ Engines never touch GCS during inference — they read from `/content/pdfs/{orgn
 
 code("""!python -m scripts.download_pdfs""")
 
-md("""## 4 · Pull the latest calibration plan
+md("""## 4 · Calibration plan
 
-Run `python -m scripts.calibrate --n 10` on a spot VM first if no calibration exists yet.""")
+Pulls the latest plan from GCS. If none exists yet, runs `scripts.calibrate --n 10` \
+in-place to measure each engine on 10 PDFs (~20-40 min, depending on which model \
+weights have to download).
+
+Set `FORCE_RECALIBRATE = True` to re-measure even if a plan already exists.""")
 
 code("""from google.cloud import storage
-import json
+import json, subprocess, sys
+
+FORCE_RECALIBRATE = False
 
 cli = storage.Client()
 blob = cli.bucket('sondre_brreg_data').blob('raw/ocr_bench_11k/_calibration.json')
-if not blob.exists():
-    raise SystemExit('NO CALIBRATION FOUND. Run `python -m scripts.calibrate --n 10` on a spot VM first.')
-cal = json.loads(blob.download_as_text())
-open('engine_calibration.json','w').write(json.dumps(cal, indent=2, default=str))
-print('plan:')
+
+if blob.exists() and not FORCE_RECALIBRATE:
+    cal = json.loads(blob.download_as_text())
+    open('engine_calibration.json','w').write(json.dumps(cal, indent=2, default=str))
+    print('using existing calibration from GCS')
+else:
+    print('no calibration found — running scripts.calibrate --n 10 now')
+    rc = subprocess.run([sys.executable, '-m', 'scripts.calibrate', '--n', '10'],
+                        check=False).returncode
+    if rc != 0:
+        raise SystemExit(f'calibration exited {rc} — see output above')
+    cal = json.loads(open('engine_calibration.json').read())
+
+print('\\nplan:')
 print(json.dumps(cal.get('plan'), indent=2))""")
 
 md("""## 5 · Launch parallel engine processes
