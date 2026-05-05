@@ -363,45 +363,360 @@ def make_tabula():
     return fn
 
 
+# === Word-level engines (from ocr-cascade-eval) — preserve token bbox + conf
+# and re-cluster integers row-wise. Emit `full_text` (joined per row) so the
+# standard score_ocr_text still works AND emit structured `numbers` / `pages`
+# for downstream cascade analysis.
+
+import re as _re_word
+
+
+def _row_cluster_numbers(words, x_gap_threshold=100, row_bin_px=15):
+    """Group same-row tokens into integers via median-gap heuristic.
+
+    `words` is a list of dicts with keys: text, bbox=[x0,y0,x1,y1], conf.
+    Returns list of {value, n_tokens, avg_conf}.
+    """
+    by_row = {}
+    for w in words:
+        cy = (w['bbox'][1] + w['bbox'][3]) / 2
+        row_id = int(round(cy / row_bin_px))
+        by_row.setdefault(row_id, []).append(w)
+    found = []
+    for ws in by_row.values():
+        ws.sort(key=lambda w: w['bbox'][0])
+        i = 0
+        while i < len(ws):
+            t = ws[i]['text']
+            if not _re_word.match(r'^-?\d+$', t):
+                i += 1
+                continue
+            sign = '-' if t.startswith('-') else ''
+            digits = _re_word.sub(r'[^\d]', '', t)
+            x_anchor = ws[i]['bbox'][2]
+            confs = [ws[i]['conf']]
+            within_gaps = []
+            j = i + 1
+            while j < len(ws):
+                tn = ws[j]['text']
+                if not _re_word.match(r'^\d{1,3}$', tn):
+                    break
+                gap = ws[j]['bbox'][0] - x_anchor
+                if gap >= x_gap_threshold:
+                    break
+                if within_gaps:
+                    median_gap = sorted(within_gaps)[len(within_gaps)//2]
+                    if gap > 2.0 * max(median_gap, 15) and gap > 35:
+                        break
+                within_gaps.append(gap)
+                digits += tn
+                x_anchor = ws[j]['bbox'][2]
+                confs.append(ws[j]['conf'])
+                j += 1
+            try:
+                v = int(sign + digits)
+                if abs(v) >= 10:
+                    found.append({
+                        'value': v,
+                        'n_tokens': j - i,
+                        'avg_conf': round(sum(confs) / len(confs), 4),
+                    })
+            except Exception:
+                pass
+            i = max(j, i + 1)
+    return found
+
+
+def _join_words_to_full_text(per_page_words, row_bin_px=15):
+    """Reconstruct page text by row-clustering words, joining within-row by space."""
+    out_pages = []
+    for words in per_page_words:
+        by_row = {}
+        for w in words:
+            cy = (w['bbox'][1] + w['bbox'][3]) / 2
+            row_id = int(round(cy / row_bin_px))
+            by_row.setdefault(row_id, []).append(w)
+        lines = []
+        for row_id in sorted(by_row.keys()):
+            ws = sorted(by_row[row_id], key=lambda w: w['bbox'][0])
+            lines.append(' '.join(w['text'] for w in ws))
+        out_pages.append('\n'.join(lines))
+    return '\n\n'.join(out_pages)
+
+
+def make_tesseract_tsv():
+    _apt('tesseract-ocr tesseract-ocr-nor')
+    _pip('pytesseract')
+    import pytesseract
+    def fn(orgnr, b):
+        per_page_words = []
+        per_page_numbers = []
+        for img_path in b['page_imgs']:
+            data = pytesseract.image_to_data(
+                img_path, lang='nor', output_type=pytesseract.Output.DICT)
+            words = []
+            for i, w in enumerate(data['text']):
+                w = (w or '').strip()
+                if not w:
+                    continue
+                try:
+                    conf = float(data['conf'][i])
+                except Exception:
+                    conf = -1
+                if conf < 30:
+                    continue
+                left = int(data['left'][i])
+                top = int(data['top'][i])
+                width = int(data['width'][i])
+                height = int(data['height'][i])
+                words.append({
+                    'text': w,
+                    'bbox': [left, top, left + width, top + height],
+                    'conf': conf,
+                })
+            per_page_words.append(words)
+            per_page_numbers.append(_row_cluster_numbers(words))
+        full_text = _join_words_to_full_text(per_page_words)
+        all_values = sorted({n['value'] for nums in per_page_numbers for n in nums})
+        return {'full_text': full_text,
+                'n_pages': len(per_page_words),
+                'n_unique_numbers': len(all_values),
+                'all_values': all_values,
+                'pages': [{'n_words': len(w), 'n_numbers': len(n), 'numbers': n}
+                          for w, n in zip(per_page_words, per_page_numbers)]}
+    return fn
+
+
+def make_doctr_bbox():
+    _pip('python-doctr[torch]')
+    from doctr.io import DocumentFile
+    from doctr.models import ocr_predictor
+    model = ocr_predictor(pretrained=True,
+                          det_arch='db_resnet50', reco_arch='crnn_vgg16_bn')
+    def fn(orgnr, b):
+        per_page_words = []
+        per_page_numbers = []
+        for img_path in b['page_imgs']:
+            doc = DocumentFile.from_images(img_path)
+            result = model(doc)
+            page_obj = result.pages[0]
+            h, w_dim = page_obj.dimensions
+            words = []
+            for block in page_obj.blocks:
+                for line in block.lines:
+                    for word in line.words:
+                        (x0, y0), (x1, y1) = word.geometry
+                        words.append({
+                            'text': word.value,
+                            'conf': round(float(word.confidence), 4),
+                            'bbox': [int(x0 * w_dim), int(y0 * h),
+                                     int(x1 * w_dim), int(y1 * h)],
+                        })
+            per_page_words.append(words)
+            per_page_numbers.append(_row_cluster_numbers(words))
+        full_text = _join_words_to_full_text(per_page_words)
+        all_values = sorted({n['value'] for nums in per_page_numbers for n in nums})
+        return {'full_text': full_text,
+                'n_pages': len(per_page_words),
+                'n_unique_numbers': len(all_values),
+                'all_values': all_values,
+                'pages': [{'n_words': len(w), 'n_numbers': len(n), 'numbers': n,
+                           'avg_word_conf': round(sum(x['conf'] for x in w)
+                                                  / max(len(w),1), 3)}
+                          for w, n in zip(per_page_words, per_page_numbers)]}
+    return fn
+
+
+def make_ocrmypdf_hocr():
+    _apt('ocrmypdf tesseract-ocr-nor')
+    import os, subprocess, re
+    from html.parser import HTMLParser
+
+    class HocrParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.words = []
+            self.in_word = False
+            self.current_text = ''
+            self.current_bbox = None
+            self.current_conf = None
+
+        def handle_starttag(self, tag, attrs):
+            attrs_d = dict(attrs)
+            if tag == 'span' and 'ocrx_word' in (attrs_d.get('class') or ''):
+                title = attrs_d.get('title', '')
+                bbox_match = re.search(r'bbox\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', title)
+                conf_match = re.search(r'x_wconf\s+(\d+)', title)
+                if bbox_match:
+                    self.current_bbox = [int(x) for x in bbox_match.groups()]
+                if conf_match:
+                    self.current_conf = int(conf_match.group(1))
+                self.in_word = True
+                self.current_text = ''
+
+        def handle_endtag(self, tag):
+            if tag == 'span' and self.in_word:
+                t = self.current_text.strip()
+                if t and self.current_bbox is not None:
+                    self.words.append({
+                        'text': t,
+                        'bbox': self.current_bbox,
+                        'conf': self.current_conf or 0,
+                    })
+                self.in_word = False
+                self.current_bbox = None
+                self.current_conf = None
+
+        def handle_data(self, data):
+            if self.in_word:
+                self.current_text += data
+
+    def fn(orgnr, b):
+        per_page_words = []
+        per_page_numbers = []
+        for img_path in b['page_imgs']:
+            page_n = os.path.basename(img_path).split('-')[-1].split('.')[0]
+            hocr_stem = f'/tmp/_hocr_{orgnr}_{page_n}'
+            subprocess.run(['tesseract', img_path, hocr_stem,
+                            '-l', 'nor', 'hocr'],
+                           capture_output=True, timeout=180)
+            hocr_file = hocr_stem + '.hocr'
+            if not os.path.exists(hocr_file):
+                per_page_words.append([])
+                per_page_numbers.append([])
+                continue
+            parser = HocrParser()
+            with open(hocr_file, 'r', encoding='utf-8', errors='replace') as f:
+                parser.feed(f.read())
+            try:
+                os.remove(hocr_file)
+            except Exception:
+                pass
+            per_page_words.append(parser.words)
+            per_page_numbers.append(_row_cluster_numbers(parser.words))
+        full_text = _join_words_to_full_text(per_page_words)
+        all_values = sorted({n['value'] for nums in per_page_numbers for n in nums})
+        return {'full_text': full_text,
+                'n_pages': len(per_page_words),
+                'n_unique_numbers': len(all_values),
+                'all_values': all_values,
+                'pages': [{'n_words': len(w), 'n_numbers': len(n), 'numbers': n}
+                          for w, n in zip(per_page_words, per_page_numbers)]}
+    return fn
+
+
+def make_paddleocr_conf():
+    # Use modern paddleocr 3.x for the conf-aware API (predict()/rec_scores/rec_polys).
+    # The earlier make_paddleocr() pin (2.7.3) keeps the legacy ocr() API.
+    _pip('paddleocr paddlepaddle-gpu')
+    import re
+    from paddleocr import PaddleOCR
+    ocr = PaddleOCR(use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_detection_model_name='PP-OCRv5_mobile_det',
+                    text_recognition_model_name='latin_PP-OCRv5_mobile_rec',
+                    enable_mkldnn=False, device='cpu')
+
+    def fn(orgnr, b):
+        per_page_lines = []
+        per_page_numbers = []
+        per_page_text = []
+        for img_path in b['page_imgs']:
+            res = ocr.predict(img_path)
+            page = res[0]
+            texts = page['rec_texts']
+            scores = page['rec_scores']
+            polys = page.get('rec_polys') or []
+            lines = []
+            numbers = []
+            for i, (t, s) in enumerate(zip(texts, scores)):
+                poly = polys[i] if i < len(polys) else None
+                bbox = None
+                if poly is not None:
+                    xs = [p[0] for p in poly]
+                    ys = [p[1] for p in poly]
+                    bbox = [int(min(xs)), int(min(ys)),
+                            int(max(xs)), int(max(ys))]
+                lines.append({'text': t,
+                              'conf': round(float(s), 4),
+                              'bbox': bbox})
+                if re.search(r'\d', t):
+                    digits = re.sub(r'[^\d-]', '', t)
+                    if digits and re.match(r'^-?\d+$', digits):
+                        try:
+                            v = int(digits)
+                            if abs(v) >= 10:
+                                numbers.append({'value': v,
+                                                'raw': t,
+                                                'conf': round(float(s), 4),
+                                                'bbox': bbox,
+                                                'low_conf': float(s) < 0.85})
+                        except Exception:
+                            pass
+            per_page_lines.append(lines)
+            per_page_numbers.append(numbers)
+            per_page_text.append('\n'.join(texts))
+        full_text = '\n\n'.join(per_page_text)
+        all_values = sorted({n['value'] for nums in per_page_numbers for n in nums})
+        return {'full_text': full_text,
+                'n_pages': len(per_page_lines),
+                'n_unique_numbers': len(all_values),
+                'all_values': all_values,
+                'pages': [{'n_lines': len(l), 'n_numbers': len(n),
+                           'n_low_conf_numbers': sum(1 for x in n if x.get('low_conf')),
+                           'numbers': n}
+                          for l, n in zip(per_page_lines, per_page_numbers)]}
+    return fn
+
+
 # === Registry ===
 
 ENGINE_FACTORIES = {
-    'tesseract':    make_tesseract,
-    'easyocr':      make_easyocr,
-    'paddleocr':    make_paddleocr,
-    'ocrmypdf':     make_ocrmypdf,
-    'doctr':        make_doctr,
-    'nougat':       make_nougat,
-    'trocr':        make_trocr,
-    'surya':        make_surya,
-    'marker':       make_marker,
-    'docling':      make_docling,
-    'pix2struct':   make_pix2struct,
-    'donut':        make_donut,
-    'udop':         make_udop,
-    'layoutlmv3':   make_layoutlmv3,
-    'lilt':         make_lilt,
-    'camelot':      make_camelot,
-    'tabula':       make_tabula,
+    'tesseract':       make_tesseract,
+    'easyocr':         make_easyocr,
+    'paddleocr':       make_paddleocr,
+    'ocrmypdf':        make_ocrmypdf,
+    'doctr':           make_doctr,
+    'nougat':          make_nougat,
+    'trocr':           make_trocr,
+    'surya':           make_surya,
+    'marker':          make_marker,
+    'docling':         make_docling,
+    'pix2struct':      make_pix2struct,
+    'donut':           make_donut,
+    'udop':            make_udop,
+    'layoutlmv3':      make_layoutlmv3,
+    'lilt':            make_lilt,
+    'camelot':         make_camelot,
+    'tabula':          make_tabula,
+    'tesseract_tsv':   make_tesseract_tsv,
+    'doctr_bbox':      make_doctr_bbox,
+    'ocrmypdf_hocr':   make_ocrmypdf_hocr,
+    'paddleocr_conf':  make_paddleocr_conf,
 }
 
 # Heuristic device classification — refined by calibration into engine_calibration.json
 DEVICE_HINT = {
-    'tesseract':    'cpu',
-    'easyocr':      'gpu',
-    'paddleocr':    'gpu',
-    'ocrmypdf':     'cpu',
-    'doctr':        'gpu',
-    'nougat':       'gpu',
-    'trocr':        'gpu',
-    'surya':        'gpu',
-    'marker':       'gpu',
-    'docling':      'gpu',
-    'pix2struct':   'gpu',
-    'donut':        'gpu',
-    'udop':         'gpu',
-    'layoutlmv3':   'cpu',
-    'lilt':         'cpu',
-    'camelot':      'cpu',
-    'tabula':       'cpu',
+    'tesseract':       'cpu',
+    'easyocr':         'gpu',
+    'paddleocr':       'gpu',
+    'ocrmypdf':        'cpu',
+    'doctr':           'gpu',
+    'nougat':          'gpu',
+    'trocr':           'gpu',
+    'surya':           'gpu',
+    'marker':          'gpu',
+    'docling':         'gpu',
+    'pix2struct':      'gpu',
+    'donut':           'gpu',
+    'udop':            'gpu',
+    'layoutlmv3':      'cpu',
+    'lilt':            'cpu',
+    'camelot':         'cpu',
+    'tabula':          'cpu',
+    'tesseract_tsv':   'cpu',
+    'doctr_bbox':      'gpu',
+    'ocrmypdf_hocr':   'cpu',
+    'paddleocr_conf':  'cpu',
 }
