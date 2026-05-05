@@ -195,22 +195,52 @@ def main():
     engines_to_run = (args.engines.split(',')
                       if args.engines else list(ENGINE_FACTORIES.keys()))
 
+    gcs_client = storage.Client()
+    cal_blob = gcs_client.bucket(DATA_BUCKET).blob(CALIBRATION_BLOB)
+    progress_blob = gcs_client.bucket(DATA_BUCKET).blob(
+        f'{RESULTS_PREFIX}/_calibration_progress.jsonl')
+    progress_lines = []
+
+    def _push_progress(event, engine, **extra):
+        line = {'ts': time.time(), 'event': event, 'engine': engine, **extra}
+        progress_lines.append(json.dumps(line, default=str))
+        try:
+            progress_blob.upload_from_string('\n'.join(progress_lines) + '\n',
+                                             content_type='application/x-ndjson')
+        except Exception:
+            pass
+
     records = {}
     for name in engines_to_run:
+        _push_progress('start', name, n_done=len(records),
+                       n_total=len(engines_to_run))
         rec = calibrate_one(cli, name, sample)
         records[name] = rec
-        # Write incrementally so partial calibration survives spot preemption
+        _push_progress('finish', name, works=rec['works'],
+                       init_s=rec['init_s'], p50_s=rec['p50_s'],
+                       vram_peak_mb=rec['vram_peak_mb'],
+                       error=rec['error'])
         out = {'generated_at': time.time(),
                'sample_n': args.n,
-               'records': records}
+               'records': records,
+               'in_progress': True,
+               'completed_engines': list(records.keys()),
+               'remaining_engines': [e for e in engines_to_run
+                                     if e not in records]}
         Path(args.out).write_text(json.dumps(out, indent=2, default=str))
+        try:
+            cal_blob.upload_from_string(json.dumps(out, indent=2, default=str),
+                                        content_type='application/json')
+        except Exception:
+            pass
 
     plan = derive_parallelism_plan(records, _vram_total_mb())
     final = {'generated_at': time.time(), 'sample_n': args.n,
-             'records': records, 'plan': plan}
+             'records': records, 'plan': plan, 'in_progress': False}
     Path(args.out).write_text(json.dumps(final, indent=2, default=str))
-    storage.Client().bucket(DATA_BUCKET).blob(CALIBRATION_BLOB).upload_from_string(
-        json.dumps(final, indent=2, default=str), content_type='application/json')
+    cal_blob.upload_from_string(json.dumps(final, indent=2, default=str),
+                                content_type='application/json')
+    _push_progress('all_done', '_', n_engines=len(records))
     print(f'\nCalibration written: {args.out}', flush=True)
     print(f'Uploaded: gs://{DATA_BUCKET}/{CALIBRATION_BLOB}', flush=True)
     print(f'\nPlan:\n{json.dumps(plan, indent=2)}', flush=True)
