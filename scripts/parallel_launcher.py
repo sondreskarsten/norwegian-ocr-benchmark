@@ -75,6 +75,9 @@ def main():
     ap.add_argument('--cpu-only', action='store_true')
     ap.add_argument('--gpu-only', action='store_true')
     ap.add_argument('--max-pdfs', type=int, default=None)
+    ap.add_argument('--engines', default=None,
+                    help='comma-separated subset of engines to launch '
+                         '(intersected with the calibration plan)')
     ap.add_argument('--log-dir', default='logs')
     args = ap.parse_args()
 
@@ -84,6 +87,13 @@ def main():
 
     cpu_group = plan.get('cpu_group') or []
     gpu_groups = plan.get('gpu_groups') or []
+
+    if args.engines:
+        wanted = set(e.strip() for e in args.engines.split(','))
+        cpu_group = [e for e in cpu_group if e in wanted]
+        gpu_groups = [[e for e in g if e in wanted] for g in gpu_groups]
+        gpu_groups = [g for g in gpu_groups if g]
+        print(f'engines filter: {sorted(wanted)}', flush=True)
 
     print(f'plan: {len(cpu_group)} cpu engines, {len(gpu_groups)} gpu groups, '
           f'broken={plan.get("broken", [])}', flush=True)

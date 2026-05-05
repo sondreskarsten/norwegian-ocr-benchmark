@@ -47,7 +47,9 @@ def make_easyocr():
 
 
 def make_paddleocr():
-    _pip('paddleocr paddlepaddle-gpu')
+    # paddleocr>=3.x pulls in langchain_text_splitters; pin to 2.7.x which
+    # uses the classic API that the factory below targets.
+    _pip('paddleocr==2.7.3 paddlepaddle-gpu==2.6.1')
     from paddleocr import PaddleOCR
     ocr = PaddleOCR(use_angle_cls=False, lang='en')
     def fn(orgnr, b):
@@ -106,7 +108,9 @@ def make_doctr():
 
 
 def make_nougat():
-    _pip('nougat-ocr')
+    # Pin albumentations<2 — newer versions enforce pydantic literal validation
+    # on compression_type which rejects nougat's int default.
+    _pip('nougat-ocr "albumentations<2.0" "pydantic<2.10"')
     import torch
     from nougat import NougatModel
     from nougat.utils.checkpoint import get_checkpoint
@@ -157,7 +161,9 @@ def make_trocr():
 
 
 def make_surya():
-    _pip('surya-ocr')
+    # Pin to 0.6.13 — newer surya-ocr (>=0.7) reorganized modules and removed
+    # surya.ocr / surya.model.detection / surya.model.recognition.
+    _pip('surya-ocr==0.6.13')
     from surya.ocr import run_ocr
     from surya.model.detection.model import load_model as load_det, load_processor as load_det_proc
     from surya.model.recognition.model import load_model as load_rec
