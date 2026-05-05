@@ -8,10 +8,10 @@ import json
 cells = []
 
 def md(s):
-    cells.append({"cell_type":"markdown","metadata":{},"source":s.split("\n")})
+    cells.append({"cell_type":"markdown","metadata":{},"source":s.splitlines(keepends=True)})
 
 def code(s):
-    cells.append({"cell_type":"code","metadata":{},"source":s.split("\n"),
+    cells.append({"cell_type":"code","metadata":{},"source":s.splitlines(keepends=True),
                   "execution_count":None,"outputs":[]})
 
 # ---------- 1. Header ----------
@@ -757,6 +757,6 @@ nb = {'cells': cells,
                    'colab': {'provenance':[]}},
       'nbformat': 4, 'nbformat_minor': 5}
 import json
-with open('/home/claude/norwegian-ocr-benchmark/notebooks/ocr_benchmark_11k.ipynb','w') as f:
+with open('notebooks/ocr_benchmark_11k.ipynb','w') as f:
     json.dump(nb, f, indent=1)
 print(f"wrote notebook: {len(json.dumps(nb))} bytes, {len(cells)} cells")
