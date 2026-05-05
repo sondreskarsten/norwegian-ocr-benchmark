@@ -21,7 +21,7 @@ def build_manifest(cli=None):
         if not n.endswith('.json'):
             continue
         parts = n.replace('.json', '').split('_')
-        if len(parts) < 4 or parts[1] != 'aarsregnskap':
+        if len(parts) < 3 or parts[1] != 'aarsregnskap':
             continue
         orgnr, year = parts[0], parts[2]
         if not (orgnr.isdigit() and year.isdigit()):
