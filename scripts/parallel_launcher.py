@@ -93,6 +93,20 @@ def main():
         cpu_group = [e for e in cpu_group if e in wanted]
         gpu_groups = [[e for e in g if e in wanted] for g in gpu_groups]
         gpu_groups = [g for g in gpu_groups if g]
+        # Engines requested but not in any plan group → add as their own group.
+        # (Use case: re-running engines that calibrate marked as broken but
+        # have since been fixed in scripts/engines.py.)
+        already = set(e for g in gpu_groups for e in g) | set(cpu_group)
+        missing = sorted(wanted - already)
+        if missing:
+            from scripts.engines import DEVICE_HINT
+            for e in missing:
+                if DEVICE_HINT.get(e) == 'cpu':
+                    cpu_group.append(e)
+                else:
+                    gpu_groups.append([e])
+            print(f'engines requested but absent from calibration plan, '
+                  f'adding as standalone groups: {missing}', flush=True)
         print(f'engines filter: {sorted(wanted)}', flush=True)
 
     print(f'plan: {len(cpu_group)} cpu engines, {len(gpu_groups)} gpu groups, '
