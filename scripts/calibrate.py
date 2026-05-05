@@ -63,7 +63,7 @@ def _ram_mb():
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
 
 
-def calibrate_one(cli, engine_name, sample, dpi=DPI):
+def calibrate_one(cli, engine_name, sample, dpi=150, push_progress=None):
     print(f'\n=== {engine_name} ===', flush=True)
     record = {
         'engine': engine_name,
@@ -95,6 +95,9 @@ def calibrate_one(cli, engine_name, sample, dpi=DPI):
         print(f'  FACTORY FAILED: {record["error"]}', flush=True)
         return record
 
+    if push_progress:
+        push_progress('init_done', engine_name, init_s=record['init_s'])
+
     walls, n_chars = [], []
     for i, row in enumerate(sample):
         record['n_sampled'] += 1
@@ -114,12 +117,22 @@ def calibrate_one(cli, engine_name, sample, dpi=DPI):
             record['n_ok'] += 1
             print(f'  [{i+1}/{len(sample)}] {row["orgnr"]} wall={wall:.1f}s chars={len(text)}',
                   flush=True)
+            if push_progress:
+                push_progress('pdf_done', engine_name,
+                              i=i+1, n_total=len(sample),
+                              orgnr=row['orgnr'], wall_s=round(wall, 1),
+                              n_chars=len(text), n_pages=len(page_paths))
         except Exception as e:
             record['n_err'] += 1
             if record['error'] is None:
                 record['error'] = f'engine: {type(e).__name__}: {str(e)[:200]}'
             print(f'  [{i+1}/{len(sample)}] {row["orgnr"]} ERR: {type(e).__name__}: {e}',
                   flush=True)
+            if push_progress:
+                push_progress('pdf_err', engine_name,
+                              i=i+1, n_total=len(sample),
+                              orgnr=row['orgnr'],
+                              error=f'{type(e).__name__}: {str(e)[:120]}')
         finally:
             for p in work.glob('*'):
                 try:
@@ -186,14 +199,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--n', type=int, default=10, help='PDFs sampled per engine')
     ap.add_argument('--engines', default=None, help='comma-separated subset')
+    ap.add_argument('--skip', default='tesseract,ocrmypdf,layoutlmv3,lilt,camelot,tabula',
+                    help='comma-separated engines to skip during calibration')
+    ap.add_argument('--dpi', type=int, default=150,
+                    help='rasterization DPI for calibration (sweep can use higher)')
     ap.add_argument('--out', default='engine_calibration.json')
     args = ap.parse_args()
 
     cli = get_client()
     manifest = load_or_build_manifest()
     sample = manifest[:args.n]
-    engines_to_run = (args.engines.split(',')
-                      if args.engines else list(ENGINE_FACTORIES.keys()))
+    if args.engines:
+        engines_to_run = args.engines.split(',')
+    else:
+        engines_to_run = list(ENGINE_FACTORIES.keys())
+    skip = set(args.skip.split(',')) if args.skip else set()
+    engines_to_run = [e for e in engines_to_run if e not in skip]
+    print(f'engines: {engines_to_run}', flush=True)
+    print(f'skipped: {sorted(skip)}', flush=True)
+    print(f'dpi: {args.dpi}', flush=True)
 
     gcs_client = storage.Client()
     cal_blob = gcs_client.bucket(DATA_BUCKET).blob(CALIBRATION_BLOB)
@@ -214,7 +238,8 @@ def main():
     for name in engines_to_run:
         _push_progress('start', name, n_done=len(records),
                        n_total=len(engines_to_run))
-        rec = calibrate_one(cli, name, sample)
+        rec = calibrate_one(cli, name, sample, dpi=args.dpi,
+                            push_progress=_push_progress)
         records[name] = rec
         _push_progress('finish', name, works=rec['works'],
                        init_s=rec['init_s'], p50_s=rec['p50_s'],
@@ -226,7 +251,8 @@ def main():
                'in_progress': True,
                'completed_engines': list(records.keys()),
                'remaining_engines': [e for e in engines_to_run
-                                     if e not in records]}
+                                     if e not in records],
+               'skipped_engines': sorted(skip)}
         Path(args.out).write_text(json.dumps(out, indent=2, default=str))
         try:
             cal_blob.upload_from_string(json.dumps(out, indent=2, default=str),
@@ -236,7 +262,8 @@ def main():
 
     plan = derive_parallelism_plan(records, _vram_total_mb())
     final = {'generated_at': time.time(), 'sample_n': args.n,
-             'records': records, 'plan': plan, 'in_progress': False}
+             'records': records, 'plan': plan, 'in_progress': False,
+             'skipped_engines': sorted(skip)}
     Path(args.out).write_text(json.dumps(final, indent=2, default=str))
     cal_blob.upload_from_string(json.dumps(final, indent=2, default=str),
                                 content_type='application/json')
